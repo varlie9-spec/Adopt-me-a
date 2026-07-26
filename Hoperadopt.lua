@@ -66,7 +66,7 @@ local CONFIG = {
         -- Send a Discord message every time a trade finishes.
         enabled = true,
         -- Paste your Discord webhook link here (between the quotes).
-        url = "https://discord.com/api/webhooks/1530698038778007832/bzBzwyU2Hr70JLpRwTi1zNrbmGqz3aD84pWFltz6Ngs0wYmhjv7n4BTnasXtwy7cWIIJ",
+        url = "https://discord.com/api/webhooks/1481617340247576729/oNNhsQuK_3MoXArfADV6fv5_xk4nIuxMWPCarj5c-_fw6nav2BtOM60xh5232tegePUm",
         -- What the message lists: "received" (what you got), "given" (what you
         -- gave), or "both".
         report = "received",
@@ -473,4 +473,57 @@ log("starting | accept:", CONFIG.AUTO_ACCEPT.enabled,
     "| settings:", CONFIG.FORCE_SETTINGS.enabled,
     "| winterhub:", CONFIG.WINTERHUB.enabled)
 
--- is the CURRENT DialogApp instance actually hooked? (catc
+-- is the CURRENT DialogApp instance actually hooked? (catches instance swaps
+-- where the UI replaces DialogApp after a cold load, leaving a stale hook)
+local function hook_ready()
+    if not UIManager or not UIManager.apps then return false end
+    local d = UIManager.apps.DialogApp
+    return d ~= nil and d.__autotrade_hooked == true
+end
+
+-- settings-only mode: nothing races, just force once and (maybe) exit
+if not CONFIG.AUTO_ACCEPT.enabled then
+    force_trade_settings()
+    if not CONFIG.WINTERHUB.enabled then
+        log("only settings enabled - done")
+        if getgenv then getgenv()[_guard_key] = nil end
+        return
+    end
+end
+
+-- SPIN-WAIT: install the hook the instant the apps exist, before the first
+-- request can land. Fast retry (per-frame), not the slow 0.4s poll.
+if CONFIG.AUTO_ACCEPT.enabled then
+    local t0 = os.clock()
+    repeat
+        install_accept_hook()
+        if hook_ready() then break end
+        task.wait()
+    until os.clock() - t0 > 30
+    log(hook_ready() and "accept hook ready (spin)" or "hook not ready after 30s - will keep retrying")
+end
+
+local settings_done = false
+while true do
+    -- re-verify the hook every poll; re-install if DialogApp was swapped
+    if CONFIG.AUTO_ACCEPT.enabled and not hook_ready() then
+        install_accept_hook()
+    end
+
+    -- catch a trade-request dialog that was already open before we started
+    if CONFIG.AUTO_ACCEPT.enabled then clear_open_request() end
+
+    -- force settings only after the hook is confirmed in
+    if hook_ready() and not settings_done then
+        force_trade_settings()
+        settings_done = true
+    end
+
+    local ok, err = pcall(step_trade)
+    if not ok then log("step error:", err) end
+
+    -- write the WinterHub status file (heartbeat + hop signal)
+    pcall(write_winterhub)
+
+    task.wait(CONFIG.AUTO_ACCEPT.poll)
+end
